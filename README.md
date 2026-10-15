@@ -1,271 +1,125 @@
-# Desky — a desk companion pet
+# Desky — The Companion 🐾
 
-A small animated pet that lives on your desk. It has a face on one OLED, an
-info panel on a second OLED, a head that moves, a voice made of beeps, and it
-reads NFC cards that tell it what to do. Its main job is to nag you into
-drinking water while you work.
-
-Board: **NodeMCU ESP-12E (ESP8266)**. 3.3 V logic only.
+A smart desk companion pet powered by the **NodeMCU ESP-12E (ESP8266)**. Desky features an animated expressive face on one OLED, an interactive information dashboard on a second OLED, RFID-based work/break mode switching, physical servo gestures, hydration reminders, and customizable session timing.
 
 ---
 
-## 1. Parts
+## ✨ Features
 
-| Part | Model | Notes |
-|---|---|---|
-| Board | NodeMCU ESP-12E (ESP8266) | 3.3 V logic only |
-| Display A — face | SSD1306 OLED 0.96", 128x64, I2C | address **0x3C** |
-| Display B — info | SSD1306 OLED 0.96", 128x64, I2C | address **0x3D** (jumper changed on the module) |
-| NFC reader | RC522, SPI, 8 pins | **3.3 V only — 5 V will kill it** |
-| Servo | SG90 micro servo | needs its own 5 V supply |
-| Buzzer | Passive piezo buzzer | must be **passive**, not active |
-| Touch | TTP223 capacitive touch module | output goes HIGH when touched |
-| Cards | MIFARE Classic 1K | 4 cards: Work, Break, Sleep, Milk |
-
-## 2. Signal wiring — 9 wires
-
-| NodeMCU | GPIO | Goes to | Wire colour |
-|---|---|---|---|
-| D0 | GPIO16 | TTP223 → I/O (signal out) | purple |
-| D1 | GPIO5  | **Both OLEDs** → SCL | yellow |
-| D2 | GPIO4  | **Both OLEDs** → SDA | green |
-| D3 | GPIO0  | Buzzer → + (positive) | orange |
-| D4 | GPIO2  | RC522 → SDA (chip select) | blue |
-| D5 | GPIO14 | RC522 → SCK | white |
-| D6 | GPIO12 | RC522 → MISO | grey |
-| D7 | GPIO13 | RC522 → MOSI | pink |
-| D8 | GPIO15 | SG90 servo → signal | orange (servo's own) |
-
-Both displays sit on the same two I2C wires. They are told apart by
-**address, not by pins** — the second display costs no extra GPIO.
-
-## 3. Power wiring — use the breadboard rails
-
-**Red rail = 3.3 V**, fed from the NodeMCU `3V3` pin with a red wire. Then,
-with red wires: OLED A → VCC, OLED B → VCC, RC522 → 3.3V, RC522 → RST (tie
-RST straight to 3.3 V, this saves a GPIO), TTP223 → VCC.
-
-**Black rail = GND**, fed from the NodeMCU `GND` pin with a black wire. Then,
-with black wires: OLED A → GND, OLED B → GND, RC522 → GND, TTP223 → GND,
-Buzzer → −, Servo → brown wire, 5 V adapter → negative.
-
-**Second rail = 5 V**, from a separate **5 V 2 A adapter** — *not* from the
-NodeMCU. Servo → red wire only. Put a 1000 µF capacitor across this rail.
-
-> The 5 V adapter ground **must** join the NodeMCU ground. Without a shared
-> ground the servo will not move.
-
-> RC522 **IRQ** stays empty. Do not connect it.
-
-## 4. Module pin order — read the printed labels, never count positions
-
-- **OLED (4 pins)** — usually `GND VCC SCL SDA`, some are `VCC GND SCL SDA`.
-  Swapping VCC and GND destroys it.
-- **RC522 (8 pins)** — `SDA SCK MOSI MISO IRQ GND RST 3.3V`
-- **TTP223 (3 pins)** — usually `VCC GND I/O`
-- **SG90 servo** — brown = GND, red = 5 V, orange = signal
-- **Buzzer** — the longer leg, or the `+` mark, is positive
-
-## 5. The two displays — the core layout
-
-Physically, **A sits on top and B below it**, like a head with a chest panel.
-
-**Display A (0x3C) is the face.** It shows *only* the face, always. Never
-text, numbers, a clock or a menu — not even for a second. This is enforced in
-code: `faces.cpp` owns display A and has no text-drawing function at all.
-
-**Display B (0x3D) is the info panel.** All numbers and text live here.
-
-| Mode | Display B shows |
-|---|---|
-| IDLE | time, date, weather |
-| WORK | session timer (large font), glasses of water, minutes until next water reminder |
-| BREAK | break countdown |
-| SLEEP | blank, or dim time only |
-| EATING | nothing special, keeps previous content |
-| Card tapped | the mode name for 2 s, then back to normal content |
-| Session end | summary for 5 s — minutes worked, glasses of water |
-
-Rules the code follows:
-
-- Two `U8g2` objects, one per address. Both addresses are `#define`s in
-  `config.h` (`OLED_FACE_ADDR`, `OLED_INFO_ADDR`).
-- `Wire.setClock(400000)` — I2C fast mode. The 100 kHz default is too slow
-  for two screens.
-- **Display B is only redrawn when its content actually changed.** The last
-  drawn values are stored and compared first. Redrawing B every frame would
-  destroy the frame rate.
-- Display A redraws every frame (every 30 ms). Display B redraws at most
-  once per second.
-- An **I2C scan runs in `setup()`** and logs what it found to serial. If
-  display B is missing, Desky still runs fully on display A alone — it never
-  crashes or hangs because B is absent.
-
-## 6. Boot-strap pins — read this if the board will not boot
-
-| Pin | Must be at power-up |
-|---|---|
-| GPIO0 (D3, buzzer) | HIGH — LOW means flash mode |
-| GPIO2 (D4, RC522 SS) | HIGH |
-| GPIO15 (D8, servo) | LOW |
-
-So the code never pulls GPIO0 or GPIO2 low in `setup()`, and never calls
-`tone()` or `SPI.begin()` before the board is past its boot sequence.
+- **Dual OLED Displays (I2C single bus):**
+  - **Screen A (0x3C):** Animated expressive face (idle, happy, focused, loving, sleepy, surprised, wink, big grin).
+  - **Screen B (0x3D):** Dashboard displaying live IST clock (NTP synced), active mode, session timer, progress bar, and session summaries.
+- **RFID Mode Switching (RC522):**
+  - Tap Card #1 to start a **WORK** session.
+  - Tap Card #2 to start a **BREAK** session.
+  - Quick card learning on first boot.
+- **Physical Gestures (SG90 Servo):**
+  - Head nods on session start and card taps.
+  - Happy wiggles on button interactions and breaks.
+  - Gentle nudge for hydration reminders.
+  - Auto-detaches when idle to eliminate servo jitter and prevent brownouts.
+- **Hydration Nagging:**
+  - Alerts you every 20 minutes during work sessions to drink water with an on-screen banner, heart eyes, and a physical servo nudge.
+- **Interaction (Push Button):**
+  - Press to play with Desky and trigger spontaneous animated reactions.
+- **Session Dial (Potentiometer on A0):**
+  - Adjust session duration on the fly from 5 to 60 minutes (5-minute increments).
 
 ---
 
-## 7. Libraries
+## 🔌 Pin Map (NodeMCU ESP-12E)
 
-| Library | Used for | Install |
-|---|---|---|
-| U8g2 | both OLEDs, full buffer mode | `arduino-cli lib install U8g2` |
-| MFRC522 | RC522 NFC reader | `arduino-cli lib install MFRC522` |
-| Servo | SG90 head | built into the ESP8266 core |
-| ESP8266WiFi + `configTime` | Wi-Fi and NTP clock | built into the ESP8266 core |
+| Function | NodeMCU Pin | GPIO | Target Component | Notes |
+|---|---|---|---|---|
+| **I2C SDA** | `D2` | GPIO4 | Both OLEDs (SDA) | Shared I2C bus |
+| **I2C SCL** | `D1` | GPIO5 | Both OLEDs (SCL) | Shared I2C bus |
+| **SPI SCK** | `D5` | GPIO14 | RC522 (SCK) | RFID clock |
+| **SPI MISO** | `D6` | GPIO12 | RC522 (MISO) | RFID data out |
+| **SPI MOSI** | `D7` | GPIO13 | RC522 (MOSI) | RFID data in |
+| **RFID SS / SDA** | `D4` | GPIO2 | RC522 (SDA / NSS) | Chip select |
+| **RFID RST** | `3V3` | — | RC522 (RST) | Tied to 3.3V (always on) |
+| **Servo Signal** | `D8` | GPIO15 | SG90 Servo (PWM) | Signal wire |
+| **Button** | `D3` | GPIO0 | Push Button | `INPUT_PULLUP` to GND |
+| **Session Dial** | `A0` | ADC0 | Potentiometer wiper | 0 - 3.3V |
 
-## 8. Files
+> [!TIP]
+> Add a **470 µF electrolytic capacitor** across the 5V power rail (VIN to GND) to buffer current spikes when the servo moves and prevent board resets.
 
+---
+
+## 📁 Project Structure
+
+```text
+Desky-The Companion/
+├── platformio.ini              # PlatformIO environment config
+├── README.md                   # Project documentation
+├── .gitignore                  # Git ignore rules (credentials protected)
+├── src/                        # PlatformIO firmware source
+│   ├── main.cpp                # Core Desky firmware
+│   ├── Animation.h             # 16 expressions × 6 frames (bitmap art)
+│   ├── credentials_example.h   # Wi-Fi template for public repos
+│   └── credentials.h           # (Private / Git-ignored) Your Wi-Fi info
+└── desky/                      # Arduino IDE standalone sketch
+    ├── desky.ino               # Arduino sketch file
+    ├── Animation.h             # Face art header
+    ├── credentials_example.h   # Wi-Fi template
+    └── credentials.h           # (Private / Git-ignored) Your Wi-Fi info
 ```
-desky/
-  desky.ino        setup, loop, mode state machine, I2C scan
-  config.h         pins, addresses, wifi creds, card UIDs, timings
-  faces.h/.cpp     face drawing + animation engine      (display A)
-  infopanel.h/.cpp info screen + change detection       (display B, step 2)
-  touch.h/.cpp     TTP223 touch: debounce, tap/hold     (step 3)
-  gestures.h/.cpp  servo moves: nod, shake, tilt, droop, wiggle  (step 5)
-  sounds.h/.cpp    buzzer tunes                                  (step 4)
-  cards.h/.cpp     NFC read, UID to card-name mapping            (step 6)
-tools/
-  i2c_scan/i2c_scan.ino  standalone: prints every I2C address found
-  read_uid/read_uid.ino  standalone: prints card UIDs only
-```
 
-`config.h` is the only file containing a pin number, an I2C address or a
-timing value. When this project moves to an ESP32, that is the only file
-that should need changing.
+---
 
-## 9. Adding a new card UID
+## ⚙️ Configuration & Credentials
 
-1. Flash `tools/read_uid/read_uid.ino` to the board.
-2. Open the serial monitor at **115200** baud.
-3. Tap a card. You will see a line like:
+To keep your Wi-Fi credentials private:
 
-   ```
-   UID: "A3 1F 7C 02"   <- paste this into config.h   (4 bytes)
-   ```
-
-4. Copy that text into the matching line in `desky/config.h`:
-
+1. Copy `credentials_example.h` to `credentials.h` inside `src/` (for PlatformIO) or `desky/` (for Arduino IDE):
    ```c
-   #define CARD_UID_WORK       "A3 1F 7C 02"
-   #define CARD_UID_BREAK      "11 22 33 44"
-   #define CARD_UID_SLEEP      "55 66 77 88"
-   #define CARD_UID_MILK       "99 AA BB CC"
+   const char *WIFI_SSID = "YOUR_WIFI_NAME";
+   const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+   ```
+2. `credentials.h` is already listed in `.gitignore` so your private details will never be committed to GitHub.
+
+---
+
+## 🚀 How to Flash
+
+### Option A: Using PlatformIO (Recommended)
+
+1. Connect your NodeMCU to your computer via micro-USB.
+2. Build the project:
+   ```bash
+   pio run
+   ```
+3. Flash the firmware:
+   ```bash
+   pio run -t upload
+   ```
+4. Open the Serial Monitor (115200 baud):
+   ```bash
+   pio device monitor
    ```
 
-   Upper case, one space between bytes, exactly as printed.
+### Option B: Using Arduino IDE
 
-5. Re-flash `desky`. You can also skip the helper sketch: the main sketch
-   prints any UID it does not recognise to serial in the same format.
-
----
-
-## 10. Building
-
-```sh
-arduino-cli core install esp8266:esp8266
-arduino-cli lib install U8g2
-arduino-cli lib install MFRC522
-
-arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 desky
-arduino-cli upload  --fqbn esp8266:esp8266:nodemcuv2 -p /dev/cu.usbserial-XXXX desky
-arduino-cli monitor -p /dev/cu.usbserial-XXXX -c baudrate=115200
-```
-
-### Apple Silicon note
-
-The ESP8266 core ships only Intel (x86_64) build tools — there is no arm64
-macOS toolchain in its package index. On an M-series Mac you need Rosetta 2:
-
-```sh
-softwareupdate --install-rosetta --agree-to-license
-```
-
-This repo's setup also replaces the core's bundled Intel `python3` helper
-with a wrapper around the system `python3`, at
-`~/Library/Arduino15/packages/esp8266/tools/python3/3.7.2-post1/python3`.
-The original binary is kept beside it as `python3.x86_64.orig`.
+1. Open **Arduino IDE**.
+2. Go to **Settings / Preferences** and ensure the ESP8266 board manager URL is added:
+   ```text
+   http://arduino.esp8266.com/stable/package_esp8266com_index.json
+   ```
+3. Open `desky/desky.ino`.
+4. Install the required libraries via **Tools > Manage Libraries**:
+   - `U8g2` by oliver
+   - `MFRC522` by GithubCommunity
+   - `Servo` (built into ESP8266 core)
+5. Select Board: **NodeMCU 1.0 (ESP-12E Module)**.
+6. Select your Port and click **Upload**.
 
 ---
 
-## 11. Build order
+## 🎮 First Boot & Card Learning
 
-Each step is finished and compiling before the next one starts.
-
-- [x] **1. I2C scan + display A: the full face and animation engine.**
-      Inputs faked over serial.
-- [x] **2. Display B, the info panel, with the change-detection redraw rule.**
-      Code done. On your board, compare `fpsA` in the serial debug line with
-      and without display B connected - it should not drop.
-- [x] 3. Touch sensor and all touch reactions
-- [ ] 4. Buzzer and all sounds
-- [ ] 5. Servo and all gestures, with the `detach()` rule
-- [ ] 6. NFC reading, the card table, mode switching
-- [ ] 7. Wi-Fi, NTP, night behaviour
-- [ ] 8. Water reminder, session tracking, summary screen
-
-## 12. Testing over serial
-
-Display A is enough to start; display B is optional (without it, `[infoB]`
-lines in the serial monitor tell you what it would have shown). Open the
-serial monitor at 115200 baud and type `help`.
-
-| Type | Commands |
-|---|---|
-| Faces | `calm happy loved surprised confused sad sleepy sleeping focus thirsty celebrate eating` |
-| Cards | `work` `break` `sleep` `milk` `unknown` `idle` — `work` again ends the session |
-| Touch | `tap` `hold` (toggles eyes shut) `annoy` `drank` `clock` |
-| Display B | `time 14:05` `notime` `weather 28` `noweather` (fake clock/weather until step 7) |
-| Gaze | `left` `right` `centre` `free` |
-| Other | `blink` `night` `day` `dim` `bright` `tour` `stop` `scan` `help` |
-
-`tour` walks through all twelve expressions, 2 seconds each — the quickest
-way to check the whole face at once. `scan` re-runs the I2C scan.
-
-At boot you should see:
-
-```
-[i2c] scanning the bus...
-[i2c]   found 0x3C  display A (face)
-[i2c]   found 0x3D  display B (info)
-```
-
-and once per second:
-
-```
-[dbg] mode=WORK face=FOCUS fpsA=33 heap=43112 water=0 dispB=yes drawsB=212 worked=3min
-```
-
-`drawsB` counts real redraws of display B. Leave Desky in IDLE with a fixed
-`time` and it stays flat; in WORK it goes up by about 1 per second.
-
----
-
-## 13. Design rules this code follows
-
-- **No `delay()` anywhere.** Every timer is a `millis()` deadline check. The
-  only legal wait is `yield()`, which hands time to the Wi-Fi stack. (The two
-  throwaway sketches in `tools/` do use `delay()` — they are not Desky.)
-- **20+ FPS on display A.** U8g2 runs in full buffer mode at a 400 kHz I2C
-  clock, and the frame is pushed in one burst every 30 ms.
-- **Display B only redraws on change**, at most once a second. The last
-  drawn screen is stored as a small struct and compared first. A redraw is
-  drawn into RAM at once but sent to the panel two pages per frame, so it
-  never causes one slow frame on display A.
-- **The NFC reader is polled every 200 ms**, never every loop.
-- **`servo.detach()` whenever the head is still.** The Servo library eats
-  timer cycles and makes the animation stutter if it stays attached.
-- **Wi-Fi never blocks.** If it cannot connect, Desky works fully, just
-  without the clock.
-- **Display A never shows text.** `faces.cpp` calls no font or text
-  function at all; the "?" and the Zs are drawn from lines.
+1. Desky boots, displays a splash face, connects to Wi-Fi, and syncs IST time via NTP.
+2. **Card Learning:**
+   - Tap your first RFID card → Assigned as **WORK** card.
+   - Tap your second RFID card → Assigned as **BREAK** card.
+3. Once learned, tapping the cards immediately switches Desky between Work, Break, and Idle modes!

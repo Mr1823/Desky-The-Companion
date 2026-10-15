@@ -16,3 +16,10 @@
 .DS_Store
 Thumbs.db
 
+# Private credentials (never push these!)
+src/credentials.h
+desky/credentials.h
+
+# Compile database (generated)
+compile_commands.json
+.cache/

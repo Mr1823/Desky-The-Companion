@@ -1,512 +1,962 @@
-/*
- * Desky - a desk companion pet on a NodeMCU ESP-12E (ESP8266).
- *
- * ==== BUILD STEPS 1-3 of 8 ====
- * I2C scan, display A (the face), display B (the info panel), touch sensor.
- *
- * Desky has two OLEDs on the same two I2C wires, told apart by address:
- *   display A, 0x3C - the FACE. Only ever the face. No text, no numbers.
- *   display B, 0x3D - the INFO PANEL. Every word and digit lives there.
- *
- * Display B lives in infopanel.cpp. If it is not connected, Desky runs on
- * display A alone. Nothing but the face ever reaches display A.
- *
- * The TTP223 touch sensor is live (touch.cpp): single tap, double tap,
- * 5-tap annoy, 2 s hold, 300 ms ack (water reminder priority rule).
- * Serial commands remain as test overrides.
- *
- * The buzzer, servo, NFC reader and Wi-Fi are not wired up in code yet,
- * so those inputs are still faked over serial. Open the serial monitor at
- * 115200 baud and type "help".
- *
- * Golden rules (the long version is in config.h):
- *   - no delay() anywhere, every timer is a millis() deadline
- *   - nothing in loop() may block, the animation must never freeze
- */
+// ═══════════════════════════════════════════════════════════════════════════
+//  Desky – The Companion  v1.0
+//  A desk-pet that keeps time, runs work/break sessions, reminds you to
+//  drink water, and reacts to your touch (button) and RFID card taps.
+//
+//  Hardware:
+//    NodeMCU ESP-12E          – the brain
+//    OLED A  (0x3C, I2C)     – face / expressions
+//    OLED B  (0x3D, I2C)     – info panel (clock, mode, timers)
+//    RC522   (SPI)           – RFID mode switching
+//    SG90 servo              – physical gestures
+//    Push button             – interaction trigger
+//    Potentiometer (A0)      – session length dial (5-60 min)
+//
+//  Pin map (NodeMCU):
+//    I2C  SDA = D2 (GPIO4)   SCL = D1 (GPIO5)
+//    SPI  SCK = D5 (GPIO14)  MISO = D6 (GPIO12)  MOSI = D7 (GPIO13)
+//    RC522 SS = D4 (GPIO2)   RST = tied to 3V3
+//    Servo    = D8 (GPIO15)  ← change if you wire differently
+//    Button   = D3 (GPIO0)   ← change if you wire differently
+//    Pot      = A0
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include <ESP8266WiFi.h>
+#include <MFRC522.h>
+#include <SPI.h>
+#include <Servo.h>
+#include <U8g2lib.h>
+#include <WiFiUdp.h>
 #include <Wire.h>
-#include "config.h"
-#include "faces.h"
-#include "infopanel.h"
-#include "touch.h"
+#include <time.h>
 
-// =====================================================================
-// MODES
-// =====================================================================
-enum Mode { MODE_IDLE, MODE_WORK, MODE_BREAK, MODE_SLEEP, MODE_EATING };
+#include "Animation.h"
 
-static const char *const MODE_NAMES[] = {"IDLE", "WORK", "BREAK", "SLEEP", "EATING"};
+// ─── Wi-Fi credentials ─────────────────────────────────────────────────────
+// Copy credentials_example.h → credentials.h and add your SSID/password.
+// credentials.h is git-ignored so your password stays private.
+#include "credentials.h"
 
-static Mode     mode        = MODE_IDLE;
-static Mode     modeBefore  = MODE_IDLE;   // where EATING / BREAK return to
-static uint32_t modeStarted = 0;
+// ─── Pin definitions ────────────────────────────────────────────────────────
+#define PIN_SERVO D8    // SG90 signal – change if needed
+#define PIN_BUTTON D3   // Push button  – change if needed
+#define PIN_POT A0      // Potentiometer
+#define PIN_RC522_SS D4 // RC522 SDA/SS (GPIO2)
+// RC522 RST is tied to 3V3 (always enabled)
 
-// Session counters, kept for the summary on display B (step 8).
-static uint32_t workStartedAt  = 0;
-static uint16_t glassesOfWater = 0;
-static uint16_t happiness      = 0;
-static uint32_t lastWaterAt    = 0;   // start of the current water countdown
+// ─── OLED displays (U8g2, I2C, hardware address) ───────────────────────────
+// Face display at 0x3C
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oledFace(U8G2_R0,
+                                             /* reset */ U8X8_PIN_NONE);
+// Info panel at 0x3D
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oledInfo(U8G2_R0,
+                                             /* reset */ U8X8_PIN_NONE);
 
-// MILK interrupts a mode for 4 s. These remember what it interrupted and
-// when that mode started, so BREAK's 5 minute clock is not restarted.
-static Mode     eatReturnMode  = MODE_IDLE;
-static uint32_t eatReturnStart = 0;
+// ─── RFID ───────────────────────────────────────────────────────────────────
+// RST_PIN = UINT8_MAX signals "no reset pin" to the library (tied to 3V3)
+MFRC522 rfid(PIN_RC522_SS, UINT8_MAX);
 
-// Which displays actually answered on the bus. Desky must run fully even
-// if display B is missing, so this is a flag and never an error.
-static bool faceDisplayFound = false;
-static bool infoDisplayFound = false;
+// ─── Servo ──────────────────────────────────────────────────────────────────
+Servo servo;
 
-// Night mode is faked with the "night" command until step 7 brings NTP in.
-static bool fakeNight = false;
+// ─── Animation player for OLED A (face) ─────────────────────────────────────
+DeskyAnimation faceAnim;
 
-// Fake clock + weather so display B can be tested before Wi-Fi exists.
-// Step 7 replaces these with real NTP time.
-static bool     fakeTimeOn    = false;
-static uint16_t fakeBaseMin   = 0;     // minutes after midnight when "time" was typed
-static uint32_t fakeBaseMs    = 0;
-static bool     fakeWeatherOn = false;
-static int16_t  fakeTempC     = 0;
+// ─── NTP / Time ─────────────────────────────────────────────────────────────
+// IST = UTC+5:30 = 19800 seconds
+#define IST_OFFSET_SEC 19800
 
-// FPS / debug
-static uint32_t lastFrameAt = 0;
-static uint32_t lastDebugAt = 0;
-static uint16_t frameCount  = 0;
-static uint16_t fps         = 0;
+// ─── Desky modes ────────────────────────────────────────────────────────────
+enum class DeskyMode : uint8_t {
+  IDLE,
+  WORK,
+  BREAK_TIME,
+  // Future:
+  // SLEEP,
+  // MILK
+};
 
-// The "tour" demo walks through every expression, 2 s each.
-static bool     tourRunning = false;
-static uint8_t  tourIndex   = 0;
-static uint32_t tourNextAt  = 0;
+// ─── Global state ───────────────────────────────────────────────────────────
+DeskyMode currentMode = DeskyMode::IDLE;
+DeskyExpression currentFace = DeskyExpression::NEUTRAL;
+bool sessionActive = false;
+uint32_t sessionStartMs = 0;
+uint32_t sessionDurationMs = 0; // set by potentiometer
+uint32_t sessionElapsedMs = 0;
+uint32_t totalWorkMs = 0;  // accumulated work time
+uint32_t totalBreakMs = 0; // accumulated break time
+uint8_t sessionsCompleted = 0;
 
-// Touch-hold: eyes stay shut while the finger is on the pad
-static bool     holdEyesActive = false;
+// Water reminder: every 20 minutes during work
+#define WATER_INTERVAL_MS (20UL * 60UL * 1000UL)
+uint32_t lastWaterRemindMs = 0;
+bool waterReminderActive = false;
 
-// Water reminder active flag. The real logic arrives in step 8; this is here
-// so the touch handler can check it when deciding whether TOUCH_ACK means
-// "I drank the water" (priority rule) or should be ignored.
-static bool     waterNagging = false;
+// Button debounce
+uint32_t lastButtonPressMs = 0;
+#define BUTTON_DEBOUNCE_MS 300
 
-// =====================================================================
-// I2C SCAN
-// =====================================================================
-// Walks every valid 7-bit address and reports who answers. Run once in
-// setup() so a wiring mistake shows up as a clear serial line instead of
-// as a mysteriously blank screen.
-static void scanI2C() {
-  Serial.println(F("[i2c] scanning the bus..."));
-  uint8_t found = 0;
+// Info panel refresh
+uint32_t lastInfoRefreshMs = 0;
+#define INFO_REFRESH_MS 500
 
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {        // 0 means the device replied
-      found++;
-      Serial.print(F("[i2c]   found 0x"));
-      if (addr < 16) Serial.print('0');
-      Serial.print(addr, HEX);
-      if      (addr == OLED_FACE_ADDR) { Serial.print(F("  display A (face)")); faceDisplayFound = true; }
-      else if (addr == OLED_INFO_ADDR) { Serial.print(F("  display B (info)")); infoDisplayFound = true; }
-      else                               Serial.print(F("  unknown device"));
-      Serial.println();
-    }
-    yield();                                  // never starve the Wi-Fi stack
-  }
+// Idle face change (periodic blink / look around)
+uint32_t lastIdleAnimMs = 0;
+#define IDLE_ANIM_INTERVAL 8000
 
-  if (found == 0)
-    Serial.println(F("[i2c] NOTHING found. Check SDA(D2), SCL(D1), 3.3V and GND."));
-  if (!faceDisplayFound)
-    Serial.println(F("[i2c] WARNING display A (0x3C) is missing - no face."));
-  if (!infoDisplayFound)
-    Serial.println(F("[i2c] display B (0x3D) absent - running on display A alone."));
-}
+// Servo gesture state
+bool servoAttached = false;
+uint32_t servoDetachAt = 0;
 
-// =====================================================================
-// FEEDING DISPLAY B
-// =====================================================================
-// While EATING, display B keeps showing whatever the interrupted mode
-// shows, so these two look straight through EATING to the real mode.
-static Mode     underlyingMode()  { return mode == MODE_EATING ? eatReturnMode  : mode; }
-static uint32_t underlyingStart() { return mode == MODE_EATING ? eatReturnStart : modeStarted; }
+// Potentiometer smoothing
+int potSmoothed = 512;
 
-// Collect "what is true right now" for infopanel.cpp. It decides what to
-// draw and whether anything changed - this function only reports facts.
-static void fillInfoInput(uint32_t now, InfoInput &in) {
-  memset(&in, 0, sizeof(in));
+// RFID card UIDs (will be learned on first two taps)
+uint8_t workCardUID[7] = {0};
+uint8_t workCardUIDLen = 0;
+uint8_t breakCardUID[7] = {0};
+uint8_t breakCardUIDLen = 0;
+bool workCardLearned = false;
+bool breakCardLearned = false;
 
-  switch (underlyingMode()) {
-    case MODE_WORK:  in.mode = INFO_WORK;  break;
-    case MODE_BREAK: in.mode = INFO_BREAK; break;
-    case MODE_SLEEP: in.mode = INFO_SLEEP; break;
-    default:         in.mode = INFO_IDLE;  break;
-  }
+// Session summary display
+bool showingSummary = false;
+uint32_t summaryStartMs = 0;
+#define SUMMARY_DISPLAY_MS 8000
 
-  // clock (fake until step 7)
-  in.timeValid = fakeTimeOn;
-  if (fakeTimeOn) {
-    uint32_t minutes = (fakeBaseMin + (now - fakeBaseMs) / 60000UL) % 1440UL;
-    in.hour = minutes / 60;  in.minute = minutes % 60;
-    in.wday = 1;  in.mday = 22;  in.month = 9;      // a fixed example date: Mon, 22 Sep
-  }
-  in.weatherValid = fakeWeatherOn;
-  in.tempC        = fakeTempC;
+// ─── Forward declarations ───────────────────────────────────────────────────
+void connectWiFi();
+void syncTime();
+void setupOLEDs();
+void setupRFID();
+void setupServo();
 
-  // WORK
-  in.workSeconds = (now - workStartedAt) / 1000UL;
-  in.glasses     = glassesOfWater;
-  uint32_t sinceWater = now - lastWaterAt;
-  in.minsToWater = (sinceWater >= WATER_INTERVAL_MS) ? 0
-                 : (uint16_t)((WATER_INTERVAL_MS - sinceWater + 59999UL) / 60000UL);
+void handleButton();
+void handleRFID();
+void handlePotentiometer();
+void handleWaterReminder();
+void handleIdleAnimation();
+void handleServoTimeout();
+void handleSessionTimer();
 
-  // BREAK
-  uint32_t sinceBreak = now - underlyingStart();
-  in.breakSecondsLeft = (sinceBreak >= BREAK_DURATION_MS) ? 0
-                      : (BREAK_DURATION_MS - sinceBreak + 999UL) / 1000UL;
-}
+void setFace(DeskyExpression expr, uint16_t frameMs = 120);
+void setMode(DeskyMode mode);
+void startSession(DeskyMode mode);
+void endSession();
+void showSessionSummary();
 
-// =====================================================================
-// MODE SWITCHING
-// =====================================================================
+void servoGesture(const char *type);
+void servoNod();
+void servoWiggle();
+void servoNudge();
 
-// The face that belongs to a mode when nothing else is reacting.
-static Expression faceForMode(Mode m) {
-  switch (m) {
-    case MODE_WORK:   return EXP_FOCUS;
-    case MODE_BREAK:  return EXP_HAPPY;
-    case MODE_SLEEP:  return EXP_SLEEPING;
-    case MODE_EATING: return EXP_EATING;
-    case MODE_IDLE:
-    default:          return fakeNight ? EXP_SLEEPY : EXP_CALM;
-  }
-}
+void drawInfoPanel();
+void drawClock(uint8_t y);
+void drawSessionTimer(uint8_t y);
+void drawModeBadge(uint8_t y);
+void drawPotBar(uint8_t y);
+void drawSummary();
+void drawCardSetup();
 
-static void enterMode(Mode m, bool announce) {
-  if (m != MODE_EATING && m != MODE_BREAK) modeBefore = m;
-  mode        = m;
-  modeStarted = millis();
+String getTimeStr();
+uint32_t potToSessionMs();
+bool uidMatch(const uint8_t *a, uint8_t aLen, const uint8_t *b, uint8_t bLen);
 
-  facesSetBase(faceForMode(m));
-  facesSetLively(m == MODE_BREAK);          // BREAK blinks and glances more
-  facesSetDim(m == MODE_SLEEP);             // SLEEP dims the panel
-  facesSetSlow(fakeNight || m == MODE_SLEEP);
-
-  Serial.print(F("[mode] -> "));
-  Serial.println(MODE_NAMES[m]);
-  if (announce) infoFlashMode(MODE_NAMES[m]);   // display B shows the name for 2 s
-}
-
-static void setMode(Mode m) { enterMode(m, true); }
-
-// Each card tap, faked over serial for now. The real reader arrives in
-// step 6, but the behaviour here is already final.
-static void onWorkCard() {
-  if (mode == MODE_WORK) {
-    // Tapping WORK again ends the session. The summary goes on display B;
-    // the face celebrates on display A.
-    uint32_t minutes = (millis() - workStartedAt) / 60000UL;
-    uint16_t glasses = glassesOfWater;
-    glassesOfWater = 0;
-    setMode(MODE_IDLE);
-    infoShowSummary(minutes, glasses);   // after setMode, so it replaces the mode-name flash
-    facesReact(EXP_CELEBRATE);
-  } else {
-    workStartedAt  = millis();
-    lastWaterAt    = workStartedAt;
-    glassesOfWater = 0;
-    setMode(MODE_WORK);
-  }
-}
-
-static void onBreakCard() { setMode(MODE_BREAK); }
-static void onSleepCard() { setMode(MODE_SLEEP); }
-
-static void onMilkCard() {
-  // MILK does not change the mode. It plays an animation, then hands
-  // control back to whatever Desky was doing before.
-  happiness++;
-  if (mode != MODE_EATING) {          // a second milk card must not overwrite what we remember
-    eatReturnMode  = mode;
-    eatReturnStart = modeStarted;
-  }
-  mode        = MODE_EATING;
-  modeStarted = millis();
-  facesSetBase(EXP_EATING);
-  Serial.print(F("[mode] -> EATING  happiness="));
-  Serial.println(happiness);
-}
-
-static void onUnknownCard() {
-  facesReact(EXP_CONFUSED);
-  Serial.println(F("[card] unknown UID -> CONFUSED (head shake + 2 low beeps: steps 4-5)"));
-}
-
-// Time-based mode exits. No delay(), just deadline checks.
-static void updateModeTimers(uint32_t now) {
-  if (mode == MODE_EATING && now - modeStarted >= EATING_DURATION_MS) {
-    enterMode(eatReturnMode, false);   // quiet: EATING changes nothing on display B
-    modeStarted = eatReturnStart;      // BREAK keeps its original 5 minute clock
-    facesReact(EXP_HAPPY);
-  }
-  else if (mode == MODE_BREAK && now - modeStarted >= BREAK_DURATION_MS) {
-    // Break is over: look at the user, then go back to what we were doing.
-    Serial.println(F("[break] 5 min up - nudging (beep comes in step 4)"));
-    setMode(modeBefore == MODE_WORK ? MODE_WORK : MODE_IDLE);
-    facesReact(EXP_SURPRISED);
-  }
-}
-
-// =====================================================================
-// TOUCH EVENT HANDLER
-// =====================================================================
-// Called for real sensor events AND for serial test overrides.
-static void onTouchEvent(TouchEvent ev) {
-  if (ev == TOUCH_NONE) return;
-
-  // PRIORITY RULE (step 8): while a water reminder is active, a 300 ms
-  // hold means "I drank the water" and wins over every other touch.
-  if (ev == TOUCH_ACK && waterNagging) {
-    glassesOfWater++;
-    lastWaterAt = millis();
-    waterNagging = false;
-    facesReact(EXP_HAPPY);
-    Serial.print(F("[water] drank! glasses="));
-    Serial.println(glassesOfWater);
-    // Sound and servo come in steps 4-5.
-    return;
-  }
-
-  switch (ev) {
-    case TOUCH_TAP:
-      // Single tap -> LOVED face. Purr sound and servo wiggle come later.
-      facesReact(EXP_LOVED);
-      Serial.println(F("[touch] single tap -> LOVED (purr + wiggle: steps 4-5)"));
-      break;
-
-    case TOUCH_DOUBLE:
-      // Double tap -> show the clock on display B for 3 s.
-      // The face on A does NOT change.
-      infoPeekClock();
-      Serial.println(F("[touch] double tap -> clock on B for 3s"));
-      break;
-
-    case TOUCH_ANNOY:
-      // 5 fast taps -> annoyed! Head shake and low beep later.
-      facesReact(EXP_CONFUSED);
-      Serial.println(F("[touch] 5 taps -> annoyed! (beep + shake: steps 4-5)"));
-      break;
-
-    case TOUCH_HOLD:
-      // 2 s hold -> eyes close, head leans toward the hand.
-      holdEyesActive = true;
-      facesHoldEyesClosed(true);
-      Serial.println(F("[touch] hold -> eyes shut (lean: step 5)"));
-      break;
-
-    case TOUCH_RELEASE:
-      // End of a hold -> open eyes, release lean.
-      holdEyesActive = false;
-      facesHoldEyesClosed(false);
-      Serial.println(F("[touch] released -> eyes open"));
-      break;
-
-    case TOUCH_ACK:
-      // ACK without an active water reminder: ignored (not a tap, not a hold yet).
-      // Just log it so the developer can see the event.
-      Serial.println(F("[touch] ack (300ms) - no water reminder active, ignored"));
-      break;
-
-    default:
-      break;
-  }
-}
-
-// =====================================================================
-// SERIAL TEST COMMANDS  (real touch is active; serial commands remain as
-// overrides for testing without the board. Cards, Wi-Fi etc still faked.)
-// =====================================================================
-static void printHelp() {
-  Serial.println(F("\n--- Desky test commands ---"));
-  Serial.println(F("faces : calm happy loved surprised confused sad"));
-  Serial.println(F("        sleepy sleeping focus thirsty celebrate eating"));
-  Serial.println(F("cards : work break sleep milk unknown idle  (work again ends session)"));
-  Serial.println(F("touch : tap hold annoy drank clock   (serial overrides for the real sensor)"));
-  Serial.println(F("panel : time 14:05 | notime | weather 28 | noweather"));
-  Serial.println(F("gaze  : left right centre free"));
-  Serial.println(F("other : blink night day dim bright tour stop scan help"));
-  Serial.println(F("----------------------------------------\n"));
-}
-
-static bool expressionByName(const String &w, Expression &out) {
-  for (uint8_t i = 0; i < EXPRESSION_COUNT; i++) {
-    if (w.equalsIgnoreCase(facesName((Expression)i))) { out = (Expression)i; return true; }
-  }
-  return false;
-}
-
-static void handleCommand(String w) {
-  w.trim();
-  if (w.length() == 0) return;
-
-  Expression e;
-  if (expressionByName(w, e)) {                 // "happy", "sad", ...
-    tourRunning = false;
-    facesReact(e);
-    Serial.print(F("[face] ")); Serial.println(facesName(e));
-    return;
-  }
-
-  // --- fake clock / weather for display B ---
-  if (w.startsWith("time ")) {
-    int c = w.indexOf(':');
-    int h = w.substring(5).toInt();
-    int m = (c > 0) ? w.substring(c + 1).toInt() : 0;
-    if (h < 0 || h > 23 || m < 0 || m > 59) { Serial.println(F("[?] use: time 14:05")); return; }
-    fakeBaseMin = h * 60 + m;  fakeBaseMs = millis();  fakeTimeOn = true;
-    Serial.print(F("[time] fake clock set to ")); Serial.println(w.substring(5));
-    return;
-  }
-  if (w.startsWith("weather ")) {
-    fakeTempC = w.substring(8).toInt();  fakeWeatherOn = true;
-    Serial.print(F("[weather] fake temperature ")); Serial.println(fakeTempC);
-    return;
-  }
-  if (w == "notime")    { fakeTimeOn    = false; Serial.println(F("[time] clock off"));    return; }
-  if (w == "noweather") { fakeWeatherOn = false; Serial.println(F("[weather] off"));      return; }
-
-  // --- faked card taps ---
-  if      (w == "work")     onWorkCard();
-  else if (w == "break")    onBreakCard();
-  else if (w == "sleep")    onSleepCard();
-  else if (w == "milk")     onMilkCard();
-  else if (w == "unknown")  onUnknownCard();
-  else if (w == "idle")     setMode(MODE_IDLE);
-
-  // --- serial touch overrides (route through the shared handler) ---
-  else if (w == "tap")      onTouchEvent(TOUCH_TAP);
-  else if (w == "hold")     { onTouchEvent(holdEyesActive ? TOUCH_RELEASE : TOUCH_HOLD); }
-  else if (w == "annoy")    onTouchEvent(TOUCH_ANNOY);
-  else if (w == "drank")    { waterNagging = true; onTouchEvent(TOUCH_ACK); }
-  else if (w == "clock")    onTouchEvent(TOUCH_DOUBLE);
-
-  // --- gaze, which the servo will drive for real in step 5 ---
-  else if (w == "left")     facesSetGaze(-1);
-  else if (w == "right")    facesSetGaze(1);
-  else if (w == "centre" || w == "center") facesSetGaze(0);
-  else if (w == "free")     facesReleaseGaze();
-
-  // --- animation knobs ---
-  else if (w == "blink")    facesForceBlink();
-  else if (w == "night")    { fakeNight = true;  facesSetSlow(true);
-                              facesSetBase(faceForMode(mode)); Serial.println(F("[time] night")); }
-  else if (w == "day")      { fakeNight = false; facesSetSlow(mode == MODE_SLEEP);
-                              facesSetBase(faceForMode(mode)); Serial.println(F("[time] day")); }
-  else if (w == "dim")      facesSetDim(true);
-  else if (w == "bright")   facesSetDim(false);
-  else if (w == "tour")     { tourRunning = true; tourIndex = 0; tourNextAt = 0;
-                              Serial.println(F("[tour] showing every expression, 2 s each")); }
-  else if (w == "stop")     { tourRunning = false; facesClearReaction();
-                              holdEyesActive = false; facesHoldEyesClosed(false); }
-  else if (w == "scan")     scanI2C();
-  else if (w == "help" || w == "?") printHelp();
-  else { Serial.print(F("[?] unknown command: ")); Serial.println(w); }
-}
-
-static void handleSerial() {
-  static String buf;
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') { handleCommand(buf); buf = ""; }
-    else if (buf.length() < 24) buf += c;
-  }
-}
-
-// Walks through every expression so all twelve can be eyeballed in one go.
-static void updateTour(uint32_t now) {
-  if (!tourRunning || (int32_t)(now - tourNextAt) < 0) return;
-  Expression e = (Expression)(tourIndex % EXPRESSION_COUNT);
-  facesSetBase(e);
-  facesClearReaction();
-  Serial.print(F("[tour] ")); Serial.println(facesName(e));
-  tourIndex++;
-  tourNextAt = now + TOUR_STEP_MS;
-}
-
-// =====================================================================
-// DEBUG LINE: mode, FPS on display A, free heap
-// =====================================================================
-static void updateDebug(uint32_t now) {
-  if (now - lastDebugAt < DEBUG_PRINT_MS) return;
-  fps         = frameCount;           // a second has passed, so frames == FPS
-  frameCount  = 0;
-  lastDebugAt = now;
-
-  Serial.print(F("[dbg] mode="));  Serial.print(MODE_NAMES[mode]);
-  Serial.print(F(" face="));       Serial.print(facesName(facesCurrent()));
-  Serial.print(F(" fpsA="));       Serial.print(fps);
-  Serial.print(F(" heap="));       Serial.print(ESP.getFreeHeap());
-  Serial.print(F(" water="));      Serial.print(glassesOfWater);
-  Serial.print(F(" dispB="));      Serial.print(infoDisplayFound ? F("yes") : F("no"));
-  Serial.print(F(" drawsB="));     Serial.print(infoDrawCount());   // total real redraws of B
-  if (mode == MODE_WORK) {
-    Serial.print(F(" worked="));
-    Serial.print((millis() - workStartedAt) / 60000UL);
-    Serial.print(F("min"));
-  }
-  Serial.println();
-}
-
-// =====================================================================
-// SETUP / LOOP
-// =====================================================================
+// ═══════════════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════════════
 void setup() {
-  Serial.begin(SERIAL_BAUD);
-  Serial.println(F("\n\nDesky booting - step 3, face + info panel + touch"));
+  Serial.begin(115200);
+  Serial.println(F("\n\n=== Desky – The Companion v1.0 ==="));
 
-  // IMPORTANT: GPIO0 (buzzer) and GPIO2 (RC522 chip select) are boot-strap
-  // pins and are deliberately left untouched here. They are configured in
-  // steps 4 and 6, well after the board is past its boot sequence.
+  // ── Pin modes ──
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
 
-  // Bring the I2C bus up ourselves so the scan can run before any display
-  // is initialised. Fast mode: two screens on 100 kHz would be far too slow.
-  Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(OLED_I2C_CLOCK_HZ);
-  scanI2C();
+  // ── I2C ──
+  Wire.begin(D2, D1);    // SDA=D2, SCL=D1
+  Wire.setClock(400000); // 400 kHz fast mode
 
-  facesBegin();                       // display A
-  infoBegin(infoDisplayFound);        // display B (skipped cleanly if absent)
-  touchBegin();                       // TTP223 on PIN_TOUCH
-  setMode(MODE_IDLE);
-  printHelp();
+  // ── OLEDs ──
+  setupOLEDs();
+
+  // ── Boot splash on face ──
+  oledFace.clearBuffer();
+  oledFace.setFont(u8g2_font_helvB14_tr);
+  oledFace.drawStr(28, 30, "Desky");
+  oledFace.setFont(u8g2_font_helvR08_tr);
+  oledFace.drawStr(22, 48, "waking up...");
+  oledFace.sendBuffer();
+
+  // ── Boot info on panel ──
+  oledInfo.clearBuffer();
+  oledInfo.setFont(u8g2_font_helvR08_tr);
+  oledInfo.drawStr(4, 12, "Connecting to WiFi...");
+  oledInfo.sendBuffer();
+
+  // ── Wi-Fi ──
+  connectWiFi();
+
+  // ── NTP time sync ──
+  oledInfo.clearBuffer();
+  oledInfo.setFont(u8g2_font_helvR08_tr);
+  oledInfo.drawStr(4, 12, "Syncing time (IST)...");
+  oledInfo.sendBuffer();
+  syncTime();
+
+  // ── SPI + RFID ──
+  SPI.begin();
+  setupRFID();
+
+  // ── Servo ──
+  setupServo();
+
+  // ── Ready! ──
+  Serial.println(F("Desky is ready!"));
+  setFace(DeskyExpression::HAPPY);
+
+  oledInfo.clearBuffer();
+  oledInfo.setFont(u8g2_font_helvB10_tr);
+  oledInfo.drawStr(30, 35, "Ready!");
+  oledInfo.sendBuffer();
+  delay(800);
+
+  // ── Show card setup if cards not learned ──
+  lastInfoRefreshMs = millis();
+  lastIdleAnimMs = millis();
+  lastWaterRemindMs = millis();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════════════════════════════════
 void loop() {
   uint32_t now = millis();
 
-  handleSerial();
-  onTouchEvent(touchUpdate(now));    // real TTP223 sensor
-  updateTour(now);
-  updateModeTimers(now);
-  facesUpdate(now);               // blink / glance / breathe timers
+  // ── Face animation update ──
+  faceAnim.update(oledFace, now);
 
-  // Display B: only build and compare a new screen when it is allowed to
-  // change (at most once a second). infoUpdate() draws nothing if the
-  // content is the same as last time.
-  if (infoDue(now)) {
-    InfoInput in;
-    fillInfoInput(now, in);
-    infoUpdate(now, in);
+  // ── Button ──
+  handleButton();
+
+  // ── RFID ──
+  handleRFID();
+
+  // ── Potentiometer ──
+  handlePotentiometer();
+
+  // ── Session timer ──
+  handleSessionTimer();
+
+  // ── Water reminder (work mode only) ──
+  handleWaterReminder();
+
+  // ── Idle animation (only when idle and not animating) ──
+  if (currentMode == DeskyMode::IDLE && !faceAnim.isPlaying()) {
+    handleIdleAnimation();
   }
 
-  // Display A redraws on a fixed interval. Display B, once it exists, will
-  // redraw at most once a second and only when its content has changed.
-  if (now - lastFrameAt >= FRAME_INTERVAL_MS) {
-    lastFrameAt = now;
-    facesRender();
-    frameCount++;
-    infoFlushStep();                // a slice of display B's new picture, if one is pending
+  // ── Info panel refresh ──
+  if (now - lastInfoRefreshMs >= INFO_REFRESH_MS) {
+    lastInfoRefreshMs = now;
+    if (showingSummary) {
+      if (now - summaryStartMs >= SUMMARY_DISPLAY_MS) {
+        showingSummary = false;
+        setMode(DeskyMode::IDLE);
+      } else {
+        drawSummary();
+      }
+    } else {
+      drawInfoPanel();
+    }
   }
 
-  updateDebug(now);
+  // ── Servo auto-detach ──
+  handleServoTimeout();
 
-  // Not a delay: this hands a few microseconds to the Wi-Fi stack so it is
-  // never starved. yield() / delay(0) are the only legal waits in here.
-  yield();
+  yield(); // ESP8266 watchdog
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Wi-Fi
+// ═══════════════════════════════════════════════════════════════════════════
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to %s ", WIFI_SSID);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print('.');
+    attempts++;
+
+    // Animate dots on info panel
+    oledInfo.clearBuffer();
+    oledInfo.setFont(u8g2_font_helvR08_tr);
+    String dots = "Connecting";
+    for (int i = 0; i < (attempts % 4); i++)
+      dots += ".";
+    oledInfo.drawStr(4, 12, dots.c_str());
+    oledInfo.drawStr(4, 28, WIFI_SSID);
+    oledInfo.sendBuffer();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+    oledInfo.clearBuffer();
+    oledInfo.setFont(u8g2_font_helvR08_tr);
+    oledInfo.drawStr(4, 12, "WiFi connected!");
+    oledInfo.drawStr(4, 28, WiFi.localIP().toString().c_str());
+    oledInfo.sendBuffer();
+    delay(600);
+  } else {
+    Serial.println(F("\nWiFi failed! Running offline."));
+    oledInfo.clearBuffer();
+    oledInfo.setFont(u8g2_font_helvR08_tr);
+    oledInfo.drawStr(4, 12, "WiFi failed!");
+    oledInfo.drawStr(4, 28, "Running offline");
+    oledInfo.sendBuffer();
+    delay(1000);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  NTP Time Sync (IST)
+// ═══════════════════════════════════════════════════════════════════════════
+void syncTime() {
+  // Use ESP8266's built-in SNTP
+  configTime(IST_OFFSET_SEC, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print(F("Waiting for NTP sync"));
+  time_t now = time(nullptr);
+  int tries = 0;
+  while (now < 100000 && tries < 20) {
+    delay(500);
+    Serial.print('.');
+    now = time(nullptr);
+    tries++;
+  }
+  Serial.println();
+  if (now > 100000) {
+    struct tm *tm = localtime(&now);
+    Serial.printf("Time synced: %02d:%02d:%02d IST\n", tm->tm_hour, tm->tm_min,
+                  tm->tm_sec);
+  } else {
+    Serial.println(F("NTP sync failed, clock may be wrong."));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  OLED Setup
+// ═══════════════════════════════════════════════════════════════════════════
+void setupOLEDs() {
+  // Face display at 0x3C
+  oledFace.setI2CAddress(0x3C * 2); // U8g2 uses 8-bit address
+  oledFace.begin();
+  oledFace.setFontMode(1);
+  oledFace.setBitmapMode(1);
+
+  // Info panel at 0x3D
+  oledInfo.setI2CAddress(0x3D * 2); // U8g2 uses 8-bit address
+  oledInfo.begin();
+  oledInfo.setFontMode(1);
+  oledInfo.setBitmapMode(1);
+
+  Serial.println(F("OLEDs initialized (0x3C face, 0x3D info)"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RFID Setup
+// ═══════════════════════════════════════════════════════════════════════════
+void setupRFID() {
+  rfid.PCD_Init();
+  delay(50);
+  byte v = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  Serial.printf("RC522 firmware: 0x%02X %s\n", v,
+                (v == 0x91 || v == 0x92) ? "(OK)" : "(check wiring!)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Servo Setup
+// ═══════════════════════════════════════════════════════════════════════════
+void setupServo() {
+  // Don't attach yet — attach only when moving, detach after
+  // This avoids the servo jitter that can reset the NodeMCU
+  Serial.println(F("Servo on D8 (attach on demand)"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BUTTON HANDLER
+// ═══════════════════════════════════════════════════════════════════════════
+void handleButton() {
+  if (digitalRead(PIN_BUTTON) == LOW) {
+    uint32_t now = millis();
+    if (now - lastButtonPressMs < BUTTON_DEBOUNCE_MS)
+      return;
+    lastButtonPressMs = now;
+
+    Serial.println(F("Button pressed!"));
+
+    // Pick a random reaction
+    uint8_t reaction = random(0, 5);
+    switch (reaction) {
+    case 0:
+      setFace(DeskyExpression::HAPPY, 100);
+      servoGesture("wiggle");
+      break;
+    case 1:
+      setFace(DeskyExpression::WINK, 120);
+      break;
+    case 2:
+      setFace(DeskyExpression::SURPRISED, 90);
+      servoGesture("nod");
+      break;
+    case 3:
+      setFace(DeskyExpression::LAUGHING, 100);
+      servoGesture("wiggle");
+      break;
+    case 4:
+      setFace(DeskyExpression::LOVE, 130);
+      servoGesture("nod");
+      break;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RFID HANDLER — card learning + mode switching
+// ═══════════════════════════════════════════════════════════════════════════
+void handleRFID() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial())
+    return;
+
+  // Print UID
+  Serial.print(F("Card UID: "));
+  for (uint8_t i = 0; i < rfid.uid.size; i++) {
+    Serial.printf("%02X ", rfid.uid.uidByte[i]);
+  }
+  Serial.println();
+
+  // ── Card learning phase ──
+  if (!workCardLearned) {
+    // First card becomes WORK card
+    memcpy(workCardUID, rfid.uid.uidByte, rfid.uid.size);
+    workCardUIDLen = rfid.uid.size;
+    workCardLearned = true;
+    Serial.println(F(">> WORK card learned!"));
+
+    setFace(DeskyExpression::HAPPY, 100);
+    oledInfo.clearBuffer();
+    oledInfo.setFont(u8g2_font_helvB10_tr);
+    oledInfo.drawStr(10, 20, "WORK card");
+    oledInfo.drawStr(10, 38, "learned!");
+    oledInfo.setFont(u8g2_font_helvR08_tr);
+    oledInfo.drawStr(10, 55, "Now tap BREAK card");
+    oledInfo.sendBuffer();
+    delay(1500);
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    return;
+  }
+
+  if (!breakCardLearned) {
+    // Check it's not the same card
+    if (uidMatch(rfid.uid.uidByte, rfid.uid.size, workCardUID,
+                 workCardUIDLen)) {
+      oledInfo.clearBuffer();
+      oledInfo.setFont(u8g2_font_helvR08_tr);
+      oledInfo.drawStr(10, 30, "Same card! Use a");
+      oledInfo.drawStr(10, 44, "different one.");
+      oledInfo.sendBuffer();
+      delay(1000);
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      return;
+    }
+    memcpy(breakCardUID, rfid.uid.uidByte, rfid.uid.size);
+    breakCardUIDLen = rfid.uid.size;
+    breakCardLearned = true;
+    Serial.println(F(">> BREAK card learned!"));
+
+    setFace(DeskyExpression::BIG_GRIN, 100);
+    oledInfo.clearBuffer();
+    oledInfo.setFont(u8g2_font_helvB10_tr);
+    oledInfo.drawStr(10, 20, "BREAK card");
+    oledInfo.drawStr(10, 38, "learned!");
+    oledInfo.setFont(u8g2_font_helvR08_tr);
+    oledInfo.drawStr(10, 55, "Desky is ready!");
+    oledInfo.sendBuffer();
+    servoGesture("nod");
+    delay(1500);
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    return;
+  }
+
+  // ── Mode switching ──
+  if (uidMatch(rfid.uid.uidByte, rfid.uid.size, workCardUID, workCardUIDLen)) {
+    Serial.println(F(">> WORK card tapped"));
+    if (currentMode == DeskyMode::WORK) {
+      // Already working — show encouragement
+      setFace(DeskyExpression::HAPPY, 100);
+    } else {
+      if (sessionActive)
+        endSession();
+      startSession(DeskyMode::WORK);
+    }
+  } else if (uidMatch(rfid.uid.uidByte, rfid.uid.size, breakCardUID,
+                      breakCardUIDLen)) {
+    Serial.println(F(">> BREAK card tapped"));
+    if (currentMode == DeskyMode::BREAK_TIME) {
+      setFace(DeskyExpression::WINK, 100);
+    } else {
+      if (sessionActive)
+        endSession();
+      startSession(DeskyMode::BREAK_TIME);
+    }
+  } else {
+    // Unknown card
+    Serial.println(F(">> Unknown card"));
+    setFace(DeskyExpression::CONFUSED, 100);
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  POTENTIOMETER HANDLER
+// ═══════════════════════════════════════════════════════════════════════════
+void handlePotentiometer() {
+  int raw = analogRead(PIN_POT);
+  // Exponential smoothing
+  potSmoothed = potSmoothed + ((raw - potSmoothed) >> 2);
+}
+
+uint32_t potToSessionMs() {
+  // Map 0-1023 → 5-60 minutes in 5-minute steps
+  int minutes = map(potSmoothed, 0, 1023, 1, 12); // 1-12 steps
+  minutes = constrain(minutes, 1, 12) * 5;        // 5,10,...,60
+  return (uint32_t)minutes * 60UL * 1000UL;
+}
+
+int potToSessionMinutes() {
+  int minutes = map(potSmoothed, 0, 1023, 1, 12);
+  return constrain(minutes, 1, 12) * 5;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SESSION MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+void startSession(DeskyMode mode) {
+  currentMode = mode;
+  sessionActive = true;
+  sessionStartMs = millis();
+  sessionDurationMs = potToSessionMs();
+  sessionElapsedMs = 0;
+  lastWaterRemindMs = millis();
+  waterReminderActive = false;
+  showingSummary = false;
+
+  uint32_t mins = sessionDurationMs / 60000UL;
+  Serial.printf("Session started: %s for %lu min\n",
+                mode == DeskyMode::WORK ? "WORK" : "BREAK", mins);
+
+  if (mode == DeskyMode::WORK) {
+    setFace(DeskyExpression::CURIOUS, 100); // focused look
+    servoGesture("nod");
+  } else {
+    setFace(DeskyExpression::HAPPY, 120); // relaxed
+    servoGesture("wiggle");
+  }
+}
+
+void endSession() {
+  if (!sessionActive)
+    return;
+
+  uint32_t elapsed = millis() - sessionStartMs;
+
+  if (currentMode == DeskyMode::WORK) {
+    totalWorkMs += elapsed;
+  } else if (currentMode == DeskyMode::BREAK_TIME) {
+    totalBreakMs += elapsed;
+  }
+  sessionsCompleted++;
+
+  Serial.printf("Session ended. Total sessions: %d\n", sessionsCompleted);
+
+  sessionActive = false;
+  setFace(DeskyExpression::BIG_GRIN, 100);
+  servoGesture("nod");
+
+  // Show summary
+  showingSummary = true;
+  summaryStartMs = millis();
+}
+
+void handleSessionTimer() {
+  if (!sessionActive)
+    return;
+
+  uint32_t now = millis();
+  sessionElapsedMs = now - sessionStartMs;
+
+  if (sessionElapsedMs >= sessionDurationMs) {
+    // Session complete!
+    Serial.println(F("Session time is up!"));
+    setFace(DeskyExpression::SURPRISED, 80);
+    servoGesture("wiggle");
+    endSession();
+  }
+}
+
+void showSessionSummary() {
+  // Called by drawSummary() on the info panel
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  WATER REMINDER (during WORK mode)
+// ═══════════════════════════════════════════════════════════════════════════
+void handleWaterReminder() {
+  if (currentMode != DeskyMode::WORK || !sessionActive)
+    return;
+
+  uint32_t now = millis();
+  if (now - lastWaterRemindMs >= WATER_INTERVAL_MS) {
+    lastWaterRemindMs = now;
+    waterReminderActive = true;
+
+    Serial.println(F("Water reminder! 💧"));
+
+    // Save current face, show reminder
+    setFace(DeskyExpression::LOVE, 130); // caring face
+    servoGesture("nudge");
+
+    // The info panel will show "Drink Water!" overlay
+    // It auto-clears after a few seconds via the face animation ending
+  }
+
+  // Clear water reminder after animation completes
+  if (waterReminderActive && !faceAnim.isPlaying()) {
+    waterReminderActive = false;
+    // Restore work face
+    setFace(DeskyExpression::CURIOUS, 100);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  IDLE ANIMATION (blink, look around)
+// ═══════════════════════════════════════════════════════════════════════════
+void handleIdleAnimation() {
+  uint32_t now = millis();
+  if (now - lastIdleAnimMs < IDLE_ANIM_INTERVAL)
+    return;
+  lastIdleAnimMs = now;
+
+  // Random idle behavior
+  uint8_t action = random(0, 6);
+  switch (action) {
+  case 0:
+    setFace(DeskyExpression::WINK, 120);
+    break;
+  case 1:
+    setFace(DeskyExpression::LOOK_LEFT, 150);
+    break;
+  case 2:
+    setFace(DeskyExpression::LOOK_RIGHT, 150);
+    break;
+  case 3:
+    setFace(DeskyExpression::NEUTRAL, 100);
+    break;
+  case 4:
+    setFace(DeskyExpression::SLEEPY, 180);
+    break;
+  case 5:
+    setFace(DeskyExpression::CURIOUS, 120);
+    break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  FACE CONTROL
+// ═══════════════════════════════════════════════════════════════════════════
+void setFace(DeskyExpression expr, uint16_t frameMs) {
+  currentFace = expr;
+  faceAnim.play(expr, millis(), frameMs);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SERVO GESTURES
+// ═══════════════════════════════════════════════════════════════════════════
+void servoAttach() {
+  if (!servoAttached) {
+    servo.attach(PIN_SERVO);
+    servoAttached = true;
+    delay(20);
+  }
+}
+
+void servoScheduleDetach(uint32_t afterMs) {
+  servoDetachAt = millis() + afterMs;
+}
+
+void handleServoTimeout() {
+  if (servoAttached && millis() >= servoDetachAt && servoDetachAt != 0) {
+    servo.detach();
+    servoAttached = false;
+    servoDetachAt = 0;
+  }
+}
+
+void servoGesture(const char *type) {
+  servoAttach();
+
+  if (strcmp(type, "nod") == 0) {
+    servoNod();
+  } else if (strcmp(type, "wiggle") == 0) {
+    servoWiggle();
+  } else if (strcmp(type, "nudge") == 0) {
+    servoNudge();
+  }
+
+  servoScheduleDetach(500); // detach 500ms after last move
+}
+
+void servoNod() {
+  servo.write(90);
+  delay(100);
+  servo.write(60);
+  delay(150);
+  servo.write(90);
+  delay(150);
+  servo.write(60);
+  delay(150);
+  servo.write(90);
+}
+
+void servoWiggle() {
+  servo.write(90);
+  delay(80);
+  for (int i = 0; i < 3; i++) {
+    servo.write(70);
+    delay(100);
+    servo.write(110);
+    delay(100);
+  }
+  servo.write(90);
+}
+
+void servoNudge() {
+  // Gentle single push for water reminder
+  servo.write(90);
+  delay(100);
+  servo.write(50);
+  delay(300);
+  servo.write(90);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  MODE CONTROL
+// ═══════════════════════════════════════════════════════════════════════════
+void setMode(DeskyMode mode) {
+  currentMode = mode;
+
+  switch (mode) {
+  case DeskyMode::IDLE:
+    setFace(DeskyExpression::NEUTRAL, 100);
+    sessionActive = false;
+    break;
+  case DeskyMode::WORK:
+    setFace(DeskyExpression::CURIOUS, 100);
+    break;
+  case DeskyMode::BREAK_TIME:
+    setFace(DeskyExpression::HAPPY, 120);
+    break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  INFO PANEL DRAWING (OLED B)
+// ═══════════════════════════════════════════════════════════════════════════
+void drawInfoPanel() {
+  oledInfo.clearBuffer();
+
+  // ── Top: Mode badge ──
+  drawModeBadge(0);
+
+  // ── Middle: Clock ──
+  drawClock(18);
+
+  // ── Card setup prompt if cards not learned ──
+  if (!workCardLearned || !breakCardLearned) {
+    drawCardSetup();
+    oledInfo.sendBuffer();
+    return;
+  }
+
+  // ── Session timer or pot dial ──
+  if (sessionActive) {
+    drawSessionTimer(36);
+  } else {
+    drawPotBar(40);
+  }
+
+  // ── Water reminder overlay ──
+  if (waterReminderActive) {
+    // Draw a centered "Drink Water!" banner
+    oledInfo.setFont(u8g2_font_helvB10_tr);
+    oledInfo.setDrawColor(0);
+    oledInfo.drawBox(10, 24, 108, 20);
+    oledInfo.setDrawColor(1);
+    oledInfo.drawFrame(10, 24, 108, 20);
+    oledInfo.drawStr(16, 39, "\x07 Drink Water!");
+  }
+
+  oledInfo.sendBuffer();
+}
+
+void drawModeBadge(uint8_t y) {
+  const char *label;
+  switch (currentMode) {
+  case DeskyMode::WORK:
+    label = "[ WORK ]";
+    break;
+  case DeskyMode::BREAK_TIME:
+    label = "[ BREAK ]";
+    break;
+  default:
+    label = "~ Desky ~";
+    break;
+  }
+
+  oledInfo.setFont(u8g2_font_helvB10_tr);
+  // Center the text
+  int w = oledInfo.getStrWidth(label);
+  oledInfo.drawStr((128 - w) / 2, y + 11, label);
+
+  // Divider line
+  oledInfo.drawHLine(0, y + 14, 128);
+}
+
+void drawClock(uint8_t y) {
+  String timeStr = getTimeStr();
+  oledInfo.setFont(u8g2_font_helvB14_tr);
+  int w = oledInfo.getStrWidth(timeStr.c_str());
+  oledInfo.drawStr((128 - w) / 2, y + 15, timeStr.c_str());
+}
+
+void drawSessionTimer(uint8_t y) {
+  uint32_t remainMs = 0;
+  if (sessionElapsedMs < sessionDurationMs) {
+    remainMs = sessionDurationMs - sessionElapsedMs;
+  }
+  uint32_t remainSec = remainMs / 1000;
+  uint32_t mins = remainSec / 60;
+  uint32_t secs = remainSec % 60;
+
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu", mins, secs);
+
+  oledInfo.setFont(u8g2_font_helvB12_tr);
+  int w = oledInfo.getStrWidth(buf);
+  oledInfo.drawStr((128 - w) / 2, y + 13, buf);
+
+  // Progress bar
+  uint8_t barY = y + 18;
+  uint8_t barW = 100;
+  uint8_t barX = (128 - barW) / 2;
+  oledInfo.drawFrame(barX, barY, barW, 6);
+
+  float progress = 0;
+  if (sessionDurationMs > 0) {
+    progress = (float)sessionElapsedMs / (float)sessionDurationMs;
+  }
+  progress = constrain(progress, 0.0f, 1.0f);
+  uint8_t fillW = (uint8_t)(progress * (barW - 2));
+  if (fillW > 0) {
+    oledInfo.drawBox(barX + 1, barY + 1, fillW, 4);
+  }
+}
+
+void drawPotBar(uint8_t y) {
+  int mins = potToSessionMinutes();
+  char buf[24];
+  snprintf(buf, sizeof(buf), "Session: %d min", mins);
+
+  oledInfo.setFont(u8g2_font_helvR08_tr);
+  int w = oledInfo.getStrWidth(buf);
+  oledInfo.drawStr((128 - w) / 2, y + 10, buf);
+
+  // Small bar showing pot position
+  uint8_t barY = y + 14;
+  uint8_t barW = 80;
+  uint8_t barX = (128 - barW) / 2;
+  oledInfo.drawFrame(barX, barY, barW, 4);
+  uint8_t fillW = map(potSmoothed, 0, 1023, 0, barW - 2);
+  if (fillW > 0) {
+    oledInfo.drawBox(barX + 1, barY + 1, fillW, 2);
+  }
+}
+
+void drawSummary() {
+  oledInfo.clearBuffer();
+
+  oledInfo.setFont(u8g2_font_helvB10_tr);
+  oledInfo.drawStr(20, 12, "Session Done!");
+  oledInfo.drawHLine(0, 15, 128);
+
+  oledInfo.setFont(u8g2_font_helvR08_tr);
+
+  char buf[32];
+  uint32_t workMins = totalWorkMs / 60000UL;
+  uint32_t breakMins = totalBreakMs / 60000UL;
+
+  snprintf(buf, sizeof(buf), "Total work:  %lu min", workMins);
+  oledInfo.drawStr(8, 30, buf);
+
+  snprintf(buf, sizeof(buf), "Total break: %lu min", breakMins);
+  oledInfo.drawStr(8, 42, buf);
+
+  snprintf(buf, sizeof(buf), "Sessions: %d", sessionsCompleted);
+  oledInfo.drawStr(8, 54, buf);
+
+  oledInfo.sendBuffer();
+}
+
+void drawCardSetup() {
+  oledInfo.setFont(u8g2_font_helvR08_tr);
+  if (!workCardLearned) {
+    oledInfo.drawStr(8, 42, "Tap your WORK card");
+    oledInfo.drawStr(8, 54, "on the reader...");
+  } else if (!breakCardLearned) {
+    oledInfo.drawStr(8, 42, "Now tap BREAK card");
+    oledInfo.drawStr(8, 54, "on the reader...");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TIME UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════
+String getTimeStr() {
+  time_t now = time(nullptr);
+  struct tm *tm = localtime(&now);
+
+  if (now < 100000) {
+    // Time not synced yet
+    return String("--:--");
+  }
+
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tm->tm_hour, tm->tm_min,
+           tm->tm_sec);
+  return String(buf);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  UID COMPARISON
+// ═══════════════════════════════════════════════════════════════════════════
+bool uidMatch(const uint8_t *a, uint8_t aLen, const uint8_t *b, uint8_t bLen) {
+  if (aLen != bLen || aLen == 0)
+    return false;
+  return memcmp(a, b, aLen) == 0;
 }
